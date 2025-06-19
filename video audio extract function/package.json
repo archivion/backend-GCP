@@ -1,0 +1,12 @@
+{
+  "name": "prod-audio-extractor",
+  "version": "1.0.0",
+  "description": "Extracts audio from videos based on Pub/Sub triggers.",
+  "main": "index.js",
+  "dependencies": {
+    "@google-cloud/storage": "^7.0.0"
+  },
+  "engines": {
+    "node": "22"
+  }
+}

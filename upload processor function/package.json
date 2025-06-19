@@ -1,0 +1,19 @@
+{
+  "name": "prod-media-processor",
+  "version": "1.0.0",
+  "description": "Processes media files, stores metadata, and generates topics.",
+  "main": "index.js",
+  "dependencies": {
+    "@google-cloud/vision": "^4.0.0",
+    "@google-cloud/video-intelligence": "^5.0.0",
+    "@google-cloud/speech": "^6.0.0",
+    "@google-cloud/firestore": "^7.0.0",
+    "@google-cloud/storage": "^7.0.0",
+    "@google-cloud/pubsub": "^4.3.3",
+    "@google-cloud/vertexai": "^1.1.0",
+    "music-metadata": "^7.14.0"
+  },
+  "engines": {
+    "node": "22"
+  }
+}
