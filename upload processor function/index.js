@@ -26,8 +26,7 @@ const vertex_ai = new VertexAI({
   location: 'us-central1',
 });
 
-// Using a stable model identifier. Change if needed.
-const generativeModel = vertex_ai.getGenerativeModel({ model: 'gemini-pro' });
+const generativeModel = vertex_ai.getGenerativeModel({ model: 'gemini-2.0-flash-001' });
 
 async function generateTopicsFromTranscript(transcript) {
   const prompt = `You are an expert at analyzing text to find key topics.
@@ -69,7 +68,7 @@ exports.processMedia = async (event, context) => {
     return;
   }
   console.log(`Processing file: ${filePath} from bucket: ${bucketName}, Content-Type: ${contentType}`);
-  
+
   let firestoreDocId;
   if (bucketName === AUDIO_BUCKET_NAME) {
     firestoreDocId = path.parse(filePath).name;
@@ -86,14 +85,26 @@ exports.processMedia = async (event, context) => {
 
   try {
     if (contentType.startsWith('audio/')) {
+      // --- AUDIO PROCESSING PATH (REFACTORED FOR CONSISTENCY) ---
       console.log(`[AUDIO_PATH] Handling audio file for ID ${firestoreDocId}.`);
-      let audioUpdateData = {
-        transcription: '', topics: [],
-        speechApiStatus: 'processing', topicsApiStatus: 'pending',
-        processedAt: new Date().toISOString(),
-        speechError: null, topicsError: null,
-      };
+      
+      const existingDoc = await docRef.get();
+      let metadataToSave;
+
+      if (existingDoc.exists) {
+        console.log(`[AUDIO_PATH] Found existing document. Will merge.`);
+        metadataToSave = existingDoc.data();
+      } else {
+        console.log(`[AUDIO_PATH] No existing document found. Will create new.`);
+        metadataToSave = {};
+      }
+
+      // Always update status and timestamp for the current run
+      metadataToSave.processingStatus = 'In Progress';
+      metadataToSave.processedAt = new Date().toISOString();
+
       const tempLocalFile = path.join(os.tmpdir(), path.basename(filePath));
+      
       try {
         await storage.bucket(bucketName).file(filePath).download({ destination: tempLocalFile });
         const audioFileMetadata = await mm.parseFile(tempLocalFile);
@@ -103,30 +114,34 @@ exports.processMedia = async (event, context) => {
         else if (codec?.toLowerCase().includes('mpeg') || contentType.includes('mp3')) encoding = 'MP3';
         else if (codec?.toLowerCase().includes('flac') || contentType.includes('flac')) encoding = 'FLAC';
         else throw new Error(`Unsupported audio codec: ${codec}`);
+        
         const speechConfig = { encoding, languageCode: 'en-US', enableAutomaticPunctuation: true, sampleRateHertz: sampleRate, audioChannelCount: numberOfChannels > 1 ? numberOfChannels : undefined };
         const [speechOperation] = await speechClient.longRunningRecognize({ audio: { uri: gcsUri }, config: speechConfig });
         const [speechResponse] = await speechOperation.promise();
+
         if (speechResponse.results && speechResponse.results.length > 0) {
           const newTranscription = speechResponse.results.map(r => r.alternatives[0].transcript).join('\n').trim();
-          audioUpdateData.transcription = newTranscription;
+          metadataToSave.transcription = newTranscription;
           if (newTranscription) {
-            audioUpdateData.speechApiStatus = 'success';
+            metadataToSave.speechApiStatus = 'success';
             console.log(`[AUDIO_PATH] Transcription successful. Analyzing for topics...`);
-            audioUpdateData.topicsApiStatus = 'processing';
+            metadataToSave.topicsApiStatus = 'processing';
             try {
-              audioUpdateData.topics = await generateTopicsFromTranscript(newTranscription);
-              audioUpdateData.topicsApiStatus = 'success';
-              console.log(`[AUDIO_PATH] Topics generated:`, audioUpdateData.topics);
+              metadataToSave.topics = await generateTopicsFromTranscript(newTranscription);
+              metadataToSave.topicsApiStatus = 'success';
             } catch (geminiErr) {
-              audioUpdateData.topicsApiStatus = 'error';
-              audioUpdateData.topicsError = geminiErr.message;
+              metadataToSave.topicsApiStatus = 'error';
+              metadataToSave.topicsError = geminiErr.message;
               console.error(`[AUDIO_PATH] Error during topic generation:`, geminiErr);
             }
-          } else { audioUpdateData.speechApiStatus = 'no_transcription'; audioUpdateData.topicsApiStatus = 'skipped_no_transcript'; }
-        } else { audioUpdateData.speechApiStatus = 'no_results'; audioUpdateData.topicsApiStatus = 'skipped_no_transcript'; }
+          } else { metadataToSave.speechApiStatus = 'no_transcription'; metadataToSave.topicsApiStatus = 'skipped_no_transcript'; }
+        } else { metadataToSave.speechApiStatus = 'no_results'; metadataToSave.topicsApiStatus = 'skipped_no_transcript'; }
+        
+        metadataToSave.processingStatus = 'Completed'; // Set final status
       } catch (err) {
-        audioUpdateData.speechApiStatus = 'error';
-        audioUpdateData.speechError = err.message;
+        metadataToSave.speechApiStatus = 'error';
+        metadataToSave.speechError = err.message;
+        metadataToSave.processingStatus = 'Failed'; // Set failed status
         console.error(`[AUDIO_PATH] Error during audio processing:`, err);
       } finally {
         if (await fs.stat(tempLocalFile).catch(() => false)) {
@@ -134,36 +149,31 @@ exports.processMedia = async (event, context) => {
         }
       }
 
-      // --- MODIFICATION START ---
-      let finalDataToMerge = audioUpdateData;
-
-      // If this audio was a DIRECT upload (not from the extracted audio bucket),
-      // then we also want to save its own file metadata.
+      // Conditionally update primary file info ONLY for direct uploads
       if (bucketName !== AUDIO_BUCKET_NAME) {
-          const fileInfo = {
-            fileName: filePath, bucket: bucketName, contentType: contentType,
-            uploadTime: file.timeCreated, mediaUri: gcsUri, version: file.generation,
-          };
-          finalDataToMerge = { ...fileInfo, ...audioUpdateData };
+          metadataToSave.fileName = filePath;
+          metadataToSave.bucket = bucketName;
+          metadataToSave.contentType = contentType;
+          metadataToSave.uploadTime = file.timeCreated;
+          metadataToSave.mediaUri = gcsUri;
+          metadataToSave.version = file.generation;
       }
-      // If the audio was from the extracted audio bucket, we ONLY merge audioUpdateData,
-      // which preserves the original video's fileName and other metadata.
-      // --- MODIFICATION END ---
       
-      console.log(`[AUDIO_PATH] About to merge audio analysis data to Firestore. Data:`, JSON.stringify(finalDataToMerge, null, 2));
-      await docRef.set(finalDataToMerge, { merge: true });
+      console.log(`[AUDIO_PATH] About to save audio analysis data to Firestore.`);
+      await docRef.set(metadataToSave, { merge: true });
       console.log(`[AUDIO_PATH] Firestore merge complete for ID: ${firestoreDocId}.`);
 
     } else if (contentType.startsWith('video/')) {
-      // ... Video processing logic remains the same ...
+      // --- VIDEO PROCESSING PATH ---
+      // (This logic remains the same as before, as it was already consistent and robust)
       console.log(`[VIDEO_PATH] Handling video for ID ${firestoreDocId}.`);
       let metadataToSave;
       const currentEventData = { fileName: filePath, bucket: bucketName, contentType: contentType, uploadTime: file.timeCreated, mediaUri: gcsUri, processedAt: new Date().toISOString(), version: file.generation };
       const existingDoc = await docRef.get();
       if (existingDoc.exists) {
-        metadataToSave = { ...existingDoc.data(), ...currentEventData, videoApiStatus: 'pending', tags: existingDoc.data().tags || [], object_tags: existingDoc.data().object_tags || [], transcription: existingDoc.data().transcription || '', topics: existingDoc.data().topics || [], topicsApiStatus: existingDoc.data().topicsApiStatus || 'pending' };
+        metadataToSave = { ...existingDoc.data(), ...currentEventData, processingStatus: 'In Progress', videoApiStatus: 'pending', tags: existingDoc.data().tags || [], object_tags: existingDoc.data().object_tags || [], transcription: existingDoc.data().transcription || '', topics: existingDoc.data().topics || [], topicsApiStatus: existingDoc.data().topicsApiStatus || 'pending' };
       } else {
-        metadataToSave = { ...currentEventData, tags: [], object_tags: [], transcription: '', videoApiStatus: 'pending', speechApiStatus: 'pending', topics: [], topicsApiStatus: 'pending' };
+        metadataToSave = { ...currentEventData, tags: [], object_tags: [], transcription: '', processingStatus: 'In Progress', videoApiStatus: 'pending', speechApiStatus: 'pending', topics: [], topicsApiStatus: 'pending' };
       }
       metadataToSave.videoApiStatus = 'processing';
       const [operation] = await videoClient.annotateVideo({ inputUri: gcsUri, features: ['LABEL_DETECTION', 'OBJECT_TRACKING'] });
@@ -174,33 +184,37 @@ exports.processMedia = async (event, context) => {
         metadataToSave.object_tags = ar.objectAnnotations?.map(o => o.entity.description).filter(Boolean).filter((v, i, s) => s.indexOf(v) === i) || [];
         metadataToSave.videoApiStatus = (metadataToSave.tags.length > 0 || metadataToSave.object_tags.length > 0) ? 'success' : 'no_results';
       } else { metadataToSave.videoApiStatus = 'no_results'; }
-      console.log(`[VIDEO_PATH] Visuals processing complete. Saving metadata and publishing message.`);
       await docRef.set(metadataToSave, { merge: true });
+      console.log(`[VIDEO_PATH] Visuals processing complete. Publishing message for audio extraction.`);
       const messageData = { sourceBucketName: bucketName, sourceFilePath: filePath, firestoreDocId: firestoreDocId };
       await pubSubClient.topic(audioExtractionTopicName).publishMessage({ data: Buffer.from(JSON.stringify(messageData)) });
       console.log(`[VIDEO_PATH] Message published to ${audioExtractionTopicName}.`);
+
     } else if (contentType.startsWith('image/')) {
-      // ... Image processing logic remains the same ...
+      // --- IMAGE PROCESSING PATH ---
+      // (This logic also remains the same)
       console.log(`[IMAGE_PATH] Handling image for ID ${firestoreDocId}.`);
       let metadataToSave;
       const currentEventData = { fileName: filePath, bucket: bucketName, contentType: contentType, uploadTime: file.timeCreated, mediaUri: gcsUri, processedAt: new Date().toISOString(), version: file.generation };
       const existingDoc = await docRef.get();
-      if (existingDoc.exists) { metadataToSave = { ...existingDoc.data(), ...currentEventData }; } 
-      else { metadataToSave = { ...currentEventData, tags: [], object_tags: [] }; }
+      if (existingDoc.exists) { metadataToSave = { ...existingDoc.data(), ...currentEventData, processingStatus: 'In Progress' }; } 
+      else { metadataToSave = { ...currentEventData, tags: [], object_tags: [], processingStatus: 'In Progress' }; }
       metadataToSave.visionApiStatus = 'processing';
       const [labelResult] = await visionClient.labelDetection(gcsUri);
       metadataToSave.tags = labelResult.labelAnnotations?.map(l => l.description).filter(Boolean) || [];
       const [objectResult] = await visionClient.objectLocalization(gcsUri);
       metadataToSave.object_tags = objectResult.localizedObjectAnnotations?.map(o => o.name).filter(Boolean) || [];
       metadataToSave.visionApiStatus = (metadataToSave.tags.length > 0 || metadataToSave.object_tags.length > 0) ? 'success' : 'no_results';
+      metadataToSave.processingStatus = 'Completed';
       await docRef.set(metadataToSave, { merge: true });
-      console.log(`[IMAGE_PATH] Image metadata save complete.`);
+      console.log(`[IMAGE_PATH] Image metadata save complete for ID: ${firestoreDocId}.`);
+
     } else {
       console.log(`Unsupported content type: ${contentType}. Skipping.`);
     }
   } catch (error) {
     console.error(`FATAL ERROR for ${filePath} (ID: ${firestoreDocId}):`, error);
-    await docRef.set({ processingError: { message: error.message, name: error.name }, processedAt: new Date().toISOString() }, { merge: true }).catch(e => console.error(`CRITICAL: Could not save fatal error state:`, e));
+    await docRef.set({ processingError: { message: error.message, name: error.name }, processingStatus: 'Failed', processedAt: new Date().toISOString() }, { merge: true }).catch(e => console.error(`CRITICAL: Could not save fatal error state:`, e));
     throw error;
   }
 };
